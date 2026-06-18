@@ -16,8 +16,6 @@ class QAExample(BaseModel):
 class JudgeResult(BaseModel):
     score: int
     reason: str
-    missing_evidence: list[str] = Field(default_factory=list)
-    spurious_claims: list[str] = Field(default_factory=list)
 
 class ReflectionEntry(BaseModel):
     attempt_id: int

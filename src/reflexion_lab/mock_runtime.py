@@ -84,7 +84,11 @@ def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, LLMResponse
     latency_ms = int((time.time() - start) * 1000)
     tokens = response.usage.total_tokens
     data = parse_json(response.choices[0].message.content)
-    return JudgeResult(**data), LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
+    try:
+        return JudgeResult(**data), LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
+    except Exception:
+        fallback = JudgeResult(score=0, reason="Parse error - could not evaluate")
+        return fallback, LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
 
 
 def reflector(example: QAExample, attempt_id: int, judge: JudgeResult) -> tuple[ReflectionEntry, LLMResponse]:
@@ -100,7 +104,16 @@ def reflector(example: QAExample, attempt_id: int, judge: JudgeResult) -> tuple[
     latency_ms = int((time.time() - start) * 1000)
     tokens = response.usage.total_tokens
     data = parse_json(response.choices[0].message.content)
-    return ReflectionEntry(**data), LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
+    try:
+        return ReflectionEntry(**data), LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
+    except Exception:
+        fallback = ReflectionEntry(
+            attempt_id=attempt_id,
+            failure_reason=judge.reason,
+            lesson="Focus on completing all reasoning hops",
+            next_strategy="Read context carefully and answer step by step"
+        )
+        return fallback, LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
 
 
 FAILURE_MODE_BY_QID = {}

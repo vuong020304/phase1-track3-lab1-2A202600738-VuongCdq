@@ -56,5 +56,5 @@ class ReActAgent(BaseAgent):
         super().__init__(agent_type="react", max_attempts=1)
 
 class ReflexionAgent(BaseAgent):
-    def __init__(self, max_attempts: int = 3) -> None:
+    def __init__(self, max_attempts: int = 5) -> None:
         super().__init__(agent_type="reflexion", max_attempts=max_attempts)
