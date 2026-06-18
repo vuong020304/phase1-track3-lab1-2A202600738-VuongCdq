@@ -1,26 +1,106 @@
 from __future__ import annotations
+import os
+import json
+import time
+from openai import OpenAI
+from dotenv import load_dotenv
 from .schemas import QAExample, JudgeResult, ReflectionEntry
+from .prompts import ACTOR_SYSTEM, EVALUATOR_SYSTEM, REFLECTOR_SYSTEM
 from .utils import normalize_answer
 
-FIRST_ATTEMPT_WRONG = {"hp2": "London", "hp4": "Atlantic Ocean", "hp6": "Red Sea", "hp8": "Andes"}
-FAILURE_MODE_BY_QID = {"hp2": "incomplete_multi_hop", "hp4": "wrong_final_answer", "hp6": "entity_drift", "hp8": "entity_drift"}
+load_dotenv()
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-def actor_answer(example: QAExample, attempt_id: int, agent_type: str, reflection_memory: list[str]) -> str:
-    if example.qid not in FIRST_ATTEMPT_WRONG:
-        return example.gold_answer
-    if agent_type == "react":
-        return FIRST_ATTEMPT_WRONG[example.qid]
-    if attempt_id == 1 and not reflection_memory:
-        return FIRST_ATTEMPT_WRONG[example.qid]
-    return example.gold_answer
 
-def evaluator(example: QAExample, answer: str) -> JudgeResult:
-    if normalize_answer(example.gold_answer) == normalize_answer(answer):
-        return JudgeResult(score=1, reason="Final answer matches the gold answer after normalization.")
-    if normalize_answer(answer) == "london":
-        return JudgeResult(score=0, reason="The answer stopped at the birthplace city and never completed the second hop to the river.", missing_evidence=["Need to identify the river that flows through London."], spurious_claims=[])
-    return JudgeResult(score=0, reason="The final answer selected the wrong second-hop entity.", missing_evidence=["Need to ground the answer in the second paragraph."], spurious_claims=[answer])
+class LLMResponse:
+    def __init__(self, content: str, tokens: int, latency_ms: int):
+        self.content = content
+        self.tokens = tokens
+        self.latency_ms = latency_ms
 
-def reflector(example: QAExample, attempt_id: int, judge: JudgeResult) -> ReflectionEntry:
-    strategy = "Do the second hop explicitly: birthplace city -> river through that city." if example.qid == "hp2" else "Verify the final entity against the second paragraph before answering."
-    return ReflectionEntry(attempt_id=attempt_id, failure_reason=judge.reason, lesson="A partial first-hop answer is not enough; the final answer must complete all hops.", next_strategy=strategy)
+
+def parse_json(text: str) -> dict:
+    import re
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    text = text.replace("\n", " ").replace("\r", "").replace("\t", " ")
+    text = re.sub(r',\s*}', '}', text)
+    text = re.sub(r',\s*]', ']', text)
+    for i in range(len(text)):
+        if text[i] == '{':
+            depth = 0
+            for j in range(i, len(text)):
+                if text[j] == '{':
+                    depth += 1
+                elif text[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[i:j+1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+            break
+    print(f"[DEBUG] Could not parse JSON from: {text[:500]}")
+    return {"score": 0, "reason": "Parse error", "missing_evidence": [], "spurious_claims": []}
+
+
+def actor_answer(example: QAExample, attempt_id: int, agent_type: str, reflection_memory: list[str]) -> LLMResponse:
+    context_str = "\n".join(f"[{c.title}] {c.text}" for c in example.context)
+    history = ""
+    if reflection_memory:
+        history = "\n\nPrevious attempts lessons:\n" + "\n".join(reflection_memory)
+
+    start = time.time()
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": ACTOR_SYSTEM},
+            {"role": "user", "content": f"Context:\n{context_str}\n\nQuestion: {example.question}{history}\n\nAnswer:"}
+        ],
+        temperature=0,
+    )
+    latency_ms = int((time.time() - start) * 1000)
+    tokens = response.usage.total_tokens
+    return LLMResponse(content=response.choices[0].message.content.strip(), tokens=tokens, latency_ms=latency_ms)
+
+
+def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, LLMResponse]:
+    start = time.time()
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": EVALUATOR_SYSTEM},
+            {"role": "user", "content": f"Question: {example.question}\nGold answer: {example.gold_answer}\nPredicted answer: {answer}\n\nReturn JSON:"}
+        ],
+        temperature=0,
+    )
+    latency_ms = int((time.time() - start) * 1000)
+    tokens = response.usage.total_tokens
+    data = parse_json(response.choices[0].message.content)
+    return JudgeResult(**data), LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
+
+
+def reflector(example: QAExample, attempt_id: int, judge: JudgeResult) -> tuple[ReflectionEntry, LLMResponse]:
+    start = time.time()
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": REFLECTOR_SYSTEM},
+            {"role": "user", "content": f"Question: {example.question}\nWrong answer reason: {judge.reason}\nAttempt ID: {attempt_id}\n\nReturn JSON:"}
+        ],
+        temperature=0,
+    )
+    latency_ms = int((time.time() - start) * 1000)
+    tokens = response.usage.total_tokens
+    data = parse_json(response.choices[0].message.content)
+    return ReflectionEntry(**data), LLMResponse(content="", tokens=tokens, latency_ms=latency_ms)
+
+
+FAILURE_MODE_BY_QID = {}
